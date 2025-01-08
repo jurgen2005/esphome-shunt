@@ -1,5 +1,5 @@
 # esphome-shunt
-Creating a State of Charge measuring device that enables precise battery monitor through Home Assistant with the INA219 sensor unit.
+Creating a State of Charge measuring device that enables precise battery monitor through Home Assistant with the INA219 sensor unit and a 50A 75mV 0,0015Ω shunt that eplaces the original resistor on the INA219.
 
 This repository desribes how to setup a shunt that can accuratly measure the voltage current and SOC of a battery, 
 show this on a small display and feed that information to Home Assistant
