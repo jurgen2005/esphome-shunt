@@ -1,3 +1,5 @@
+# soc shunt version 0.1 
+
 esphome:
   name: shunt
   friendly_name: shunt
