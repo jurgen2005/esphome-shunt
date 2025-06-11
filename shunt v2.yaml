@@ -1,0 +1,643 @@
+esphome:
+  includes:
+    - litime_solar_mppt.h # Ensure this file is in your config directory
+  name: shunt
+  friendly_name: shunt
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: INFO # Set to DEBUG for more detailed logging during troubleshooting
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "" # Keep your existing key
+
+ota:
+  - platform: esphome
+    password: "" # Keep your existing password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light
+  fast_connect: true
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Shunt Fallback Hotspot"
+    password: ""
+
+captive_portal:
+
+# ESPHome Configuration for BT-LTMPPT4860 Solar Charge Controller
+substitutions:
+  location: solar
+  locationName: Battery Bay
+  device: litime-solar
+  deviceUnderscore: litime_solar
+  deviceName: LiTime Solar
+  deviceDescription: LiTime Solar BLE pull
+  liTimeMacAddress: C8:47:80:01:01:5C # **TODO: REPLACE WITH THE MAC FOR YOUR DEVICE**
+
+
+preferences:
+  flash_write_interval: 5min
+
+globals:
+  # Only 'global_soc' remains in globals. The other configurable parameters
+  # like max_cap, efficiency, min_volt, max_volt, and current_at_100_percent_threshold
+  # are now directly managed by their respective number.template components,
+  # and their IDs refer to those components.
+  - id: global_soc
+    type: float
+    restore_value: yes # Important for persistent storage across reboots
+    initial_value: "100.0" # Start at 100% if unknown, or set after a full charge
+
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  id: bus_a
+  frequency: 400kHz
+
+## Sensors
+
+sensor:
+  - platform: ina219
+    address: 0x40
+    shunt_resistance: 0.0015 ohm # Confirm your shunt resistor value
+    current:
+      name: "INA219 Current"
+      id: current
+      unit_of_measurement: "A"
+      device_class: "current"
+      state_class: "measurement"
+      # **IMPORTANT: CALIBRATE YOUR CURRENT SENSOR**
+      # Uncomment and tune one of the following filters based on your sensor's accuracy.
+      # If your sensor reads a non-zero value (e.g., 0.05A) when no current is flowing,
+      # you MUST compensate for it here to prevent SoC drift.
+      filters:
+        # Option 1: Linear calibration if you have a known input/output relationship
+        # - calibrate_linear:
+        #     - 0.0 -> 0.0   # If sensor reads X when true current is Y
+        #     - 10.0 -> 10.0 # Example: if sensor reads 10.0A when true current is 10.0A
+        # Option 2: Simple offset correction (if it always reads, for example, 0.05A high)
+        # - lambda: 'return x - 0.05;'
+        - median: # Helps smooth out noisy readings for more stable calculations
+            window_size: 5
+            send_every: 3
+      # The on_value_range below is for resetting 'charging_time' sensor.
+      on_value_range:
+        - below: -0.05 # If current drops below -0.05A (indicating discharge)
+          then:
+            - sensor.duty_time.reset: charging_time
+
+    power:
+      name: "INA219 Power"
+      id: power
+      unit_of_measurement: "W"
+      device_class: "power"
+      state_class: "measurement"
+    bus_voltage:
+      name: "INA219 Bus Voltage"
+      id: voltage
+      unit_of_measurement: "V"
+      device_class: "voltage"
+      state_class: "measurement"
+    shunt_voltage:
+      name: "INA219 Shunt Voltage" # Add unit_of_measurement if you wish to display this
+    max_voltage: 32.0V
+    max_current: 50A # Ensure this matches your INA219 module's configuration
+    update_interval: 500ms
+
+  - platform: template
+    name: "Wattage Calculated"
+    id: wattage_calculated
+    unit_of_measurement: "W"
+    device_class: "power"
+    state_class: "measurement"
+    lambda: |-
+      float current_val = id(current).state;
+      float voltage_val = id(voltage).state;
+      float efficiency_factor = id(efficiency).state / 100.0; // Convert percentage to factor
+
+      if (current_val > 0) { // Charging: apply efficiency factor
+        return voltage_val * current_val * efficiency_factor;
+      } else { // Discharging or idle: no efficiency factor applied
+        return voltage_val * current_val;
+      }
+    accuracy_decimals: 2
+    update_interval: 500ms
+
+  - platform: template
+    name: "Time to Discharge"
+    id: time_to_discharge
+    unit_of_measurement: "s"
+    device_class: "duration"
+    update_interval: 5s # Increased update interval for stability
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5 # Shorter window for responsiveness
+          send_every: 1
+    lambda: |-
+      if (id(current).state >= 0) { // If charging or idle, time to discharge is 0
+        return 0;
+      } else {
+        // Calculate remaining Wh and divide by absolute power (Wh / W = hours).
+        // Multiply by 3600 to convert hours to seconds.
+        if (abs(id(power).state) > 0.1) { // Avoid division by near-zero power
+          return (id(stored_capacity_new).state) / abs(id(power).state) * 3600.0;
+        } else {
+          return 0; // Or a very large number if power is very low (effectively infinite)
+        }
+      }
+
+  - platform: template
+    name: "Time to Charge"
+    id: time_to_charge
+    unit_of_measurement: "s"
+    device_class: "duration"
+    update_interval: 5s # Increased update interval for stability
+    filters:
+      - sliding_window_moving_average:
+          window_size: 15 # Larger window for charging time, which can fluctuate
+          send_every: 2
+    lambda: |-
+      if (id(current).state <= 0) { // If discharging or idle, time to charge is 0
+        return 0;
+      } else {
+        // Calculate remaining Wh to charge and divide by calculated wattage (Wh / W = hours).
+        // Use wattage_calculated as it already accounts for charge efficiency.
+        float remaining_wh = id(max_cap).state - id(stored_capacity_new).state;
+        if (id(wattage_calculated).state > 0.1) { // Avoid division by near-zero power
+          return remaining_wh / id(wattage_calculated).state * 3600.0;
+        } else {
+          return 0; // Or a very large number if charging power is very low
+        }
+      }
+
+  - platform: template
+    name: "Tailing Charge Current" # Renamed for clarity from 'Tailing charge average'
+    unit_of_measurement: "A"
+    id: tailpower # ID unchanged for compatibility
+    state_class: "measurement"
+    update_interval: 2s
+    device_class: "current"
+    accuracy_decimals: 2
+    lambda: |-
+      return float(id(current).state); // This sensor primarily provides a filtered current value
+    filters:
+      - sliding_window_moving_average:
+          window_size: 60 # Average over 60 samples (e.g., 2 minutes if update_interval is 2s)
+          send_every: 5 # Send update every 5 samples
+
+  - platform: template
+    name: "Voltage Average"
+    unit_of_measurement: "V"
+    id: voltage_avg
+    state_class: "measurement"
+    update_interval: 2s
+    device_class: "voltage"
+    accuracy_decimals: 2
+    lambda: |-
+      return float(id(voltage).state);
+    filters:
+      - median: # Median filter for more stable voltage readings, useful for 0% detection
+          window_size: 30
+          send_every: 10
+
+  - platform: duty_time
+    id: charging_time
+    name: Charging Time
+    sensor: battery_charging # This binary sensor indicates if battery is charging
+    update_interval: 500ms
+
+  - platform: template
+    name: "State of Charge (Calculated)" # Clearer name
+    id: state_of_charge_new
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    lambda: |-
+      static float last_time = millis() / 1000.0; // Initialize time tracking
+      const float battery_capacity_ah_val = id(max_cap_ah).state;
+      const float current_at_100_percent_threshold_val = id(current_at_100_percent_threshold).state;
+
+      float voltage_val = id(voltage).state;
+      float current_val = id(current).state;
+      float time_now = millis() / 1000.0;
+      float dt = time_now - last_time;
+
+      if (dt > 0) {
+        float delta_charge_ah = current_val * (dt / 3600.0);
+
+        // Apply charge efficiency if charging (current > 0)
+        if (current_val > 0) {
+          delta_charge_ah *= (id(efficiency).state / 100.0);
+        }
+
+        id(global_soc) += (delta_charge_ah / battery_capacity_ah_val) * 100.0;
+
+        // --- Voltage & Current-based corrections (Crucial for accuracy) ---
+
+        // 1. Full Charge Detection: Battery is considered 100% when voltage is high (max_volt)
+        // AND charging current is low (below current_at_100_percent_threshold).
+        // This is key to correcting drift at the top end.
+        if (voltage_val >= id(max_volt).state && current_val > 0 && current_val <= current_at_100_percent_threshold_val) {
+          id(global_soc) = 100.0;
+          ESP_LOGI("soc", "SoC set to 100%% due to high voltage (%.2fV) and low charging current (%.2fA).", voltage_val, current_val);
+        }
+        // 2. Low Voltage Cutoff (0% detection): When average voltage drops below min_volt.
+        else if (id(voltage_avg).state <= id(min_volt).state) {
+          id(global_soc) = 0.0;
+          ESP_LOGW("soc", "SoC set to 0%% due to low voltage (%.2fV).", id(voltage_avg).state);
+        }
+
+        // Constrain SoC between 0% and 100% to prevent impossible values
+        id(global_soc) = fmax(0.0, fmin(100.0, id(global_soc)));
+
+        last_time = time_now;
+      }
+
+      return id(global_soc);
+    update_interval: 10s
+
+  - platform: template
+    name: "Stored Capacity (Wh)" # Clearer name
+    id: stored_capacity_new
+    unit_of_measurement: "Wh"
+    accuracy_decimals: 1
+    lambda: |-
+      const float battery_full_capacity_wh = id(max_cap).state;
+      float soc = id(state_of_charge_new).state;
+      return (soc / 100.0) * battery_full_capacity_wh;
+    update_interval: 10s
+
+  # LiTime BLE Sensor Templates
+  # These template sensors receive data from your `litime_solar_mppt.h` custom component.
+  # Ensure `HandleResponseData(x)` correctly publishes values to these IDs.
+  - platform: template
+    name: "LiTime Battery Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    id: battery_voltage
+    device_class: voltage
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Solar Current"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    id: battery_current
+    device_class: current
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Solar Power"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    id: battery_power
+    device_class: "power"
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Controller Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    id: controller_temp
+    device_class: "temperature"
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Load Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    id: load_voltage
+    device_class: voltage
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Load Current"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    id: load_current
+    device_class: current
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Load Power"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    id: load_power
+    device_class: "power"
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime PV Input Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    id: pv_voltage
+    device_class: voltage
+    state_class: measurement
+
+  - platform: template
+    name: "LiTime Max Charging Power Today"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    id: max_charge_power
+    device_class: "power"
+    state_class: measurement # Use 'measurement' if it's a peak, 'total_increasing' if it accumulates daily
+
+  - platform: template
+    name: "LiTime Power Generation Today"
+    unit_of_measurement: "Wh"
+    accuracy_decimals: 0
+    id: energy_today
+    device_class: "energy"
+    state_class: total_increasing # Correct for accumulated energy
+
+  - platform: template
+    name: "LiTime Running Days"
+    unit_of_measurement: "days"
+    accuracy_decimals: 0
+    id: running_days
+    state_class: total_increasing # Correct for accumulated days
+
+  - platform: template
+    name: "LiTime Total Power Generation"
+    unit_of_measurement: "Wh"
+    accuracy_decimals: 0
+    id: total_energy
+    device_class: "energy"
+    state_class: total_increasing # Correct for accumulated energy
+
+  - platform: template
+    name: "LiTime Battery Level (Voltage-Based)" # Renamed to differentiate from SoC
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    device_class: "battery"
+    # This voltage-based battery level provides a general idea, but SoC is more precise
+    lambda: |-
+      if (id(battery_voltage).has_state()) {
+        float voltage = id(battery_voltage).state;
+        // **TODO: Adjust these voltage mapping values accurately for your 4S LiFePO4 battery**
+        // These represent typical voltage points for 0% and 100% for a LiFePO4 battery.
+        // It's a linear approximation and will not be as accurate as coulomb counting.
+        float min_voltage_level = 11.0; // e.g., 2.75V/cell * 4 (under light load)
+        float max_voltage_level = 14.4; // e.g., typical absorption/float voltage
+        return std::min(100.0f, std::max(0.0f, (voltage - min_voltage_level) / (max_voltage_level - min_voltage_level) * 100.0f));
+      } else {
+        return 0.0f;
+      }
+
+  # Custom component to handle BLE notifications from the LiTime MPPT
+  - platform: ble_client
+    ble_client_id: ltmppt_client
+    id: ble_sensor
+    internal: true # Marks sensor as internal, won't show in Home Assistant directly
+    service_uuid: "ffe0"
+    characteristic_uuid: "ffe1"
+    type: characteristic
+    notify: true # Enable notifications from the BLE characteristic
+    update_interval: never # Data is pushed via notify, not polled
+
+    lambda: |-
+      // Display the hex string for debugging in ESPHome logs.
+      std::vector<uint8_t> data = x;
+      String hex_string = "";
+      for (size_t i = 0; i < x.size(); ++i) {
+        char hex_buffer[3];
+        snprintf(hex_buffer, sizeof(hex_buffer), "%02X", data[i]);
+        hex_string += hex_buffer;
+        if (i % 2 == 1 && i != data.size() - 1) {
+          hex_string += " "; // Insert a space every two bytes
+        }
+      }
+      ESP_LOGD("ble_sensor", "Received hex string: %s", hex_string.c_str());
+
+      // Call your custom C++ function to parse the BLE data and update template sensors
+      HandleResponseData(x);
+      return 0.0; // This sensor itself doesn't return a value, just triggers the lambda
+
+## Buttons
+
+button:
+  - platform: restart
+    name: "Shunt Restart"
+
+## Bluetooth LE Tracker
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true # Aggressive scanning to find devices quickly
+
+## Configurable Number Inputs
+
+# These numbers allow you to fine-tune battery parameters and SoC calculation from Home Assistant.
+number:
+  - platform: template
+    name: Battery Capacity Wh
+    id: max_cap # This ID is now uniquely associated with this number component
+    unit_of_measurement: "Wh"
+    mode: "box" # Allows setting value from UI
+    max_value: 5000 # Adjust max based on your battery bank size
+    min_value: 0
+    step: 1
+    optimistic: true
+    restore_value: True # Saves value across reboots
+
+  - platform: template
+    name: Battery Capacity Ah
+    id: max_cap_ah # This ID is now uniquely associated with this number component
+    unit_of_measurement: "Ah"
+    mode: "box"
+    max_value: 500 # Adjust max based on your battery bank size
+    min_value: 10
+    step: 1
+    optimistic: true
+    restore_value: True
+
+  - platform: template
+    name: Charge Efficiency Factor
+    id: efficiency # This ID is now uniquely associated with this number component
+    unit_of_measurement: "%"
+    mode: "box"
+    max_value: 100
+    min_value: 80 # LiFePO4 is very efficient, typically 95-99%
+    step: 1
+    optimistic: true
+    restore_value: True
+
+  - platform: template
+    name: Low Voltage Reset Threshold
+    id: min_volt # This ID is now uniquely associated with this number component
+    unit_of_measurement: "V"
+    mode: "box"
+    max_value: 12 # Typical 4S LiFePO4 low cutoff (e.g., 2.75V/cell * 4 = 11V)
+    min_value: 9
+    step: 0.1
+    optimistic: true
+    restore_value: True
+
+  - platform: template
+    name: Max Voltage Reset Threshold
+    id: max_volt # This ID is now uniquely associated with this number component
+    unit_of_measurement: "V"
+    mode: "box"
+    max_value: 16 # Typical 4S LiFePO4 absorption voltage (e.g., 3.6V/cell * 4 = 14.4V)
+    min_value: 12
+    step: 0.1
+    optimistic: true
+    restore_value: True
+
+  - platform: template
+    name: Full Charge Current Threshold
+    id: current_at_100_percent_threshold # This ID is now uniquely associated with this number component
+    unit_of_measurement: "A"
+    mode: "box"
+    max_value: 50.0 # Adjust based on your battery/charger termination current
+    min_value: 0.1 # Minimum reasonable current to detect
+    step: 0.1
+    optimistic: true
+    restore_value: True
+
+## Binary Sensors
+
+binary_sensor:
+  - platform: template
+    name: "Battery is Charging"
+    id: battery_charging
+    lambda: |-
+      // A small positive threshold filters out noise around 0A
+      return id(current).state > 0.5;
+    filters:
+      - delayed_on: 6s  # Wait 6 seconds before switching to ON (prevents rapid toggling)
+      - delayed_off: 6s # Wait 6 seconds before switching to OFF
+
+  - platform: template
+    name: "Battery is Discharging"
+    id: battery_discharging
+    lambda: |-
+      // A small negative threshold filters out noise around 0A
+      return id(current).state < -0.5;
+    filters:
+      - delayed_on: 6s
+      - delayed_off: 6s
+
+## Display (SSD1306)
+
+font:
+  - file: 'fonts/Tahoma.ttf'
+    id: font1
+    size: 16
+    glyphs:
+      ['&', '@', '!', ',', '.', '"', '%', '(', ')', '+', '-', '_', ':', '°', '0',
+       '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E',
+       'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+       'T', 'U', 'V', 'W', 'X', 'Y', 'Z', ' ', 'a', 'b', 'c', 'd', 'e', 'f',
+       'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+       'u', 'v', 'w', 'x', 'y', 'z','å', 'ä', 'ö', '/','º','µ','³','€']
+
+  - file: 'fonts/Tahoma.ttf'
+    id: font_large
+    size: 28
+    glyphs:
+      ['&', '@', '!', ',', '.', '"', '%', '(', ')', '+', '-', '_', ':', '°', '0',
+       '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E',
+       'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+       'T', 'U', 'V', 'W', 'X', 'Y', 'Z', ' ', 'a', 'b', 'c', 'd', 'e', 'f',
+       'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+       'u', 'v', 'w', 'x', 'y', 'z','å', 'ä', 'ö', '/','º','µ','³','€']
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: my_display
+    update_interval: 0.5s
+    rotation: 180
+    lambda: |-
+      static int page = 0;
+      static int counter = 0;
+      
+      counter++;
+      if (counter >= 10) { // Switch page every 5 seconds (10 updates at 0.5s)
+        page = (page + 1) % 2; // Toggle between 0 and 1
+        counter = 0;
+      }
+      
+      if (page == 0) {
+        // Page 1: Original multi-line data with units for clarity
+        it.printf(0, 0, id(font1), TextAlign::TOP_LEFT, "%2.1fV", id(voltage).state);
+        it.printf(60, 0, id(font1), TextAlign::TOP_CENTER, "%2.1fA", id(current).state);
+        it.printf(128, 0, id(font1), TextAlign::TOP_RIGHT, "%2.0fW", id(power).state);
+        it.printf(0, 17, id(font1), TextAlign::TOP_LEFT, "SoC %2.1f %%", id(state_of_charge_new).state);
+        it.printf(0, 34, id(font1), TextAlign::TOP_LEFT, "Solar %2.0f W", id(battery_power).state);
+      } else {
+        // Page 2: SoC and wattage in large centered text
+        it.printf(64, 16, id(font_large), TextAlign::CENTER, "%2.1f%%", id(state_of_charge_new).state);
+        it.printf(64, 48, id(font_large), TextAlign::CENTER, "%2.0fW", id(power).state);        
+      }
+
+## Switches
+
+switch:
+  - platform: template
+    name: "LiTime DC Load"
+    id: dc_load
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON # Restore to ON by default if power loss
+    turn_on_action:
+      - ble_client.ble_write:
+          id: ltmppt_client
+          service_uuid: "FFE0"
+          characteristic_uuid: "FFE1"
+          value: !lambda |-
+            ESP_LOGI("mppt", "Sending load ON command");
+            // Command to turn on load: 010601200001483c
+            std::vector<uint8_t> request = {0x01, 0x06, 0x01, 0x20, 0x00, 0x01, 0x48, 0x3c};
+            return request;
+    turn_off_action:
+      - ble_client.ble_write:
+          id: ltmppt_client
+          service_uuid: "FFE0"
+          characteristic_uuid: "FFE1"
+          value: !lambda |-
+            ESP_LOGI("mppt", "Sending load OFF command");
+            // Command to turn off load: 01060120000089fc
+            std::vector<uint8_t> request = {0x01, 0x06, 0x01, 0x20, 0x00, 0x00, 0x89, 0xfc};
+            return request;
+
+## BLE Client and Intervals
+
+# Define the BLE client for the LTMPPT4860
+ble_client:
+  - mac_address: ${liTimeMacAddress} # Uses substitution for MAC address
+    id: ltmppt_client
+    auto_connect: true # Attempt to automatically reconnect
+    on_connect:
+      then:
+        - logger.log:
+            format: "BLE client connected to LiTime MPPT"
+            level: INFO
+    on_disconnect:
+      then:
+        - logger.log:
+            format: "BLE client disconnected from LiTime MPPT"
+            level: WARN # Use WARN level as disconnects can indicate an issue
+
+# Periodically request data from the LiTime MPPT
+interval:
+  - interval: 10s # Request data every 10 seconds
+    then:
+      - ble_client.ble_write:
+          id: ltmppt_client
+          service_uuid: "ffe0"
+          characteristic_uuid: "ffe1"
+          value: [0x01, 0x03, 0x01, 0x01, 0x00, 0x13, 0x54, 0x3B] # Query command
